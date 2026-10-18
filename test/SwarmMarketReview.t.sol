@@ -390,21 +390,84 @@ contract SwarmMarketReviewTest is RegistryTestSupport {
         assertEq(token.balanceOf(creator), FUNDS - 0.5 ether);
     }
 
-    function test_answerDeliveredEarlyStillRequiresSettlementWithinWindow() public {
+    /// Finding c7f7d6ef887a: an answer that arrived inside the window decides the market however
+    /// late the first settle call is, so a loser gains nothing by staying silent.
+    function test_answerDeliveredInWindowSettlesAfterDeadline() public {
         uint256 id = _fundedMarket();
-        _yes(_resolve(id));
-        vm.warp(uint256(_market(id).askedAt) + market.ANSWER_WINDOW() + 1);
+        bytes32 rid = _resolve(id);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        _yes(rid);
+        vm.warp(uint256(_market(id).askedAt) + market.ANSWER_WINDOW() + 30 days);
+        vm.expectEmit(address(market));
+        emit Settled(id, SwarmMarket.Phase.Yes, 30 ether, 60 ether, 1.2 ether, 0);
+        vm.prank(bob);
         market.settle(id);
-        _assertVoid(id);
+        assertEq(market.claimable(id, alice), 88.8 ether);
+        assertEq(market.claimable(id, bob), 0);
+        assertEq(token.balanceOf(treasury), 0.6 ether);
+        assertEq(token.balanceOf(creator), FUNDS - 0.5 ether + 0.6 ether);
     }
 
-    function test_timeoutDoesNotDependOnRegistryAvailability() public {
+    /// The window is on the signed issuedAt, not on delivery: an answer issued at the deadline and
+    /// delivered later still decides; one issued a second later voids with reason 22.
+    function test_issuedAtBoundsTheAnswerWindow() public {
+        uint256 id = _fundedMarket();
+        bytes32 rid = _resolve(id);
+        uint64 end = uint64(uint256(_market(id).askedAt) + market.ANSWER_WINDOW());
+        vm.warp(end + 2 hours);
+        OracleAttestation memory a = _attestation(rid, abi.encode(false));
+        a.answerType = 0;
+        a.issuedAt = end;
+        _deliver(rid, a, _sign(a));
+        market.settle(id);
+        assertEq(uint8(_market(id).phase), uint8(SwarmMarket.Phase.No));
+
+        id = _fundedMarket();
+        rid = _resolve(id);
+        end = uint64(uint256(_market(id).askedAt) + market.ANSWER_WINDOW());
+        vm.warp(end + 2 hours);
+        a = _attestation(rid, abi.encode(false));
+        a.answerType = 0;
+        a.issuedAt = end + 1;
+        _deliver(rid, a, _sign(a));
+        vm.expectEmit(address(market));
+        emit Settled(id, SwarmMarket.Phase.Void, 30 ether, 60 ether, 0, 22);
+        market.settle(id);
+        assertEq(uint8(_market(id).phase), uint8(SwarmMarket.Phase.Void));
+        assertEq(market.claimable(id, alice), 30 ether);
+        assertEq(market.claimable(id, bob), 60 ether);
+    }
+
+    /// settle reads the registry before applying the deadline, so it waits for a readable record.
+    function test_settleNeedsRegistryRecordThenVoidsPendingAfterDeadline() public {
         uint256 id = _fundedMarket();
         _resolve(id);
         vm.mockCallRevert(address(registry), abi.encodeWithSelector(registry.get.selector), "registry unavailable");
         vm.warp(uint256(_market(id).askedAt) + market.ANSWER_WINDOW() + 1);
+        vm.expectRevert("registry unavailable");
+        market.settle(id);
+        vm.clearMockedCalls();
+        vm.expectEmit(address(market));
+        emit Settled(id, SwarmMarket.Phase.Void, 30 ether, 60 ether, 0, 3);
         market.settle(id);
         _assertVoid(id);
+    }
+
+    /// Advisory a6554325c3be: a body Intake would refuse cannot open a market.
+    function test_openRejectsBodyLongerThanIntakeAccepts() public {
+        uint64 now_ = uint64(vm.getBlockTimestamp());
+        bytes memory body = new bytes(market.MAX_BODY_BYTES() + 1);
+        vm.prank(creator);
+        vm.expectRevert(SwarmMarket.BadTerms.selector);
+        market.open(body, now_ + 1 hours, now_ + 2 hours);
+
+        body = new bytes(market.MAX_BODY_BYTES());
+        vm.prank(creator);
+        uint256 id = market.open(body, now_ + 1 hours, now_ + 2 hours);
+        _stake(id, alice, true, 30 ether);
+        _stake(id, bob, false, 60 ether);
+        _resolve(id);
+        assertEq(uint8(_market(id).phase), uint8(SwarmMarket.Phase.Asked));
     }
 
     function test_terminalFailureStatusesRefundStakesWithoutProtocolFee() public {

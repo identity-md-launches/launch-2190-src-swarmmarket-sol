@@ -283,11 +283,13 @@ Market terms after the launch review:
   in addition to the quorum verification already performed by the registry. Smaller panels void
   with settlement reason 21. Seven is a minimum against two-seat decisions, not an assurance
   that any market size is safe. Creators can request larger panels; participants assess that risk.
-- `ANSWER_WINDOW = 3 days` is a **settlement deadline**: anyone must call `settle(id)` by
-  `askedAt + ANSWER_WINDOW`, inclusive. After it, any still-Asked market voids, even if an answer
-  is already in the registry. The live registry has no delivery timestamp, so a strict delivery
-  deadline cannot be distinguished from a late completion. This rule makes late-completion
-  transaction order irrelevant. Participants should monitor delivery and settle promptly.
+- `ANSWER_WINDOW = 3 days` is the **answer deadline**: `settle(id)` reads the registry first, and
+  a usable answer whose signed `issuedAt` is at most `askedAt + ANSWER_WINDOW` decides the market
+  whenever settle is called, so nobody gains by delaying it. A market whose ask is still pending
+  after the deadline voids (reason 3); an answer issued after it voids (reason 22), whichever of
+  the completion and the settle call lands first. settle needs the registry's `get` to answer.
+- `MAX_BODY_BYTES = 16_384`: Intake's body cap; `open` rejects a longer body, which could never
+  be asked.
 - `FEE_BPS = 200` remains 2% of the losing pool, split equally between creator and treasury
   (an odd wei goes to treasury). Winners pull their stake plus their proportional share of the
   remaining losing pool. Void markets refund stakes with no market fee; an oracle fee already

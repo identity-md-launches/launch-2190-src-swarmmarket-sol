@@ -79,7 +79,7 @@ price decreases, abandonment/one-sided refunds, zero price, the final allowed se
 overflow, wrong phases, missing allowance, failed transfers with full rollback, and registry
 rejection followed by retry. The multi-market conservation fuzz includes top-ups and price changes.
 
-### f59677ea2f6c — late completion/timeout race (low): reproduced, fixed with explicit deadline
+### f59677ea2f6c — late completion/timeout race (low): reproduced; deadline revised by c7f7d6ef887a below
 
 A snapshot test at `askedAt + 3 days + 1` produced Void when settle preceded completion, and Yes
 when completion preceded settle. The same timestamps and signed answer led to different payouts.
@@ -88,7 +88,8 @@ when completion preceded settle. The same timestamps and signed answer led to di
 always voids with reason 3, regardless of transaction order or registry availability. At the exact
 deadline a usable answer can still settle, while an unanswered ask still returns `StillPending`.
 
-**Behavior change:** this is a settlement deadline, not only an answer-delivery deadline. An answer
+**Superseded in revision (c7f7d6ef887a):** the rule described in the rest of this section voided
+answered markets and was replaced; see that section. Original rationale: this is a settlement deadline, not only an answer-delivery deadline. An answer
 delivered earlier but never settled within three days also leads to a void. Once settled, claims
 remain available indefinitely. The registry's public record stores issuance/expiry, not arrival
 time; issuance is not proof of timely delivery. Preserving a precise delivery cutoff would need
@@ -100,6 +101,45 @@ permissionless operation. Clients/participants must settle promptly, as document
 Regression tests cover both orders of late completion, exact deadline and one second later,
 an early-delivered answer left unsettled, a registry outage, and a claim a year after timely
 settlement. No test claims that an offchain mempool can be inspected by the market.
+
+### c7f7d6ef887a — in-window answer voided by a late settle (medium, revision): reproduced, fixed
+
+The reviewer's proof failed on the previous round's code with `answered-in-window market voided:
+5 != 3`: a verified 12-of-15 Yes answer delivered an hour after the ask was discarded because the
+first settle call came at `askedAt + 3 days + 1`, so the losing side profited from never settling.
+The brief voids only when nothing arrives within ANSWER_WINDOW, so the previous round's settlement
+deadline (above, f59677ea2f6c) was wrong. `settle` in `src/SwarmMarket.sol` now reads the registry
+first, as SwarmWager does: a Pending/None ask reverts StillPending until the deadline and voids
+(reason 3) after it; a terminal record is judged as before at any time. A usable answer must also
+carry a signed `issuedAt` no later than `askedAt + ANSWER_WINDOW`, else it voids with reason 22.
+That keeps f59677ea2f6c's order-independence for answers issued after the deadline; only an answer
+issued in time and completed after the deadline still depends on whether completion or a pending
+void lands first, the one-block boundary every deadline has. Trade-off: settle now needs the
+registry's `get` view to answer (it is an immutable storage read), so the previous
+registry-outage test is replaced by one showing settle waits for it and then voids.
+
+Tests (`test/SwarmMarketReview.t.sol`): `test_answerDeliveredInWindowSettlesAfterDeadline` (the
+proof's scenario, settled 30 days late, full fee split), `test_issuedAtBoundsTheAnswerWindow`
+(issued at the deadline and delivered later decides; one second later voids with reason 22),
+`test_settleNeedsRegistryRecordThenVoidsPendingAfterDeadline`. The former
+`test_answerDeliveredEarlyStillRequiresSettlementWithinWindow` asserted the defect and is replaced.
+`test_lateCompletionBeforeOrAfterSettleAlwaysVoids` passes unchanged: a late-issued answer voids
+in both orders. The reviewer's proof passes.
+
+### a6554325c3be — body over Intake's cap (low advisory, revision): reproduced, fixed
+
+`open` accepted a 16,385-byte body that Intake refuses at every resolve, locking stakes until
+abandon. `MAX_BODY_BYTES = 16_384` (Intake's limit) is now checked in `open` (BadTerms).
+Test: `test_openRejectsBodyLongerThanIntakeAccepts` (16,385 rejected; 16,384 opens and resolves).
+
+### Revision advisories left unchanged
+
+- 023382f9e5fb (SwarmWager resolve/abandon overlap): SwarmWager is already live and is not
+  deployed by this launch; its source stays unchanged. Recorded for a successor.
+- ae4125095cb5 (1-wei counter-stake spends the escrow for no fee): matches the brief's
+  "if a side is empty" rule; a minimum stake is a scope decision for the requester.
+- e9768981c96a (MIN_PANEL = 7 not in the brief): the floor is the accepted fix for imported finding
+  57ea9cc16237 and is documented in README; kept.
 
 ### 2d018e34cea4 — legacy registry manifest (info): confirmed, archived
 
@@ -155,14 +195,15 @@ forge build
 FOUNDRY_FUZZ_SEED=0x0f536a14fba389a9523f0a9ad8dcf2109d0df2a4968734af849c1184468ea88b forge test --summary
 ```
 
-Both commands passed. The full suite reports **151 passed, 0 failed, 0 skipped across 12 suites**,
+Both commands passed. After the revision the full suite reports **153 passed, 0 failed, 0 skipped
+across 12 suites**,
 including the unchanged protocol conformance vector, all original market/wager tests, and both
 registry invariant campaigns (24,576 and 12,288 calls, no handler reverts). Each of the three market
 fuzz tests ran 256 cases with the required seed. The build retains lint warnings about timestamp
 use, casts and events after external calls; it has no compilation errors.
 
-The deployment rehearsal passed. SwarmMarket creation bytecode is 8,935 bytes (9,031 with the three
-address arguments), runtime is 8,629 bytes, and library link references are empty. The historical
+The deployment rehearsal passed. After the revision SwarmMarket creation bytecode is 9,189 bytes
+(9,285 with the three address arguments), runtime is 8,883 bytes, and library link references are empty. The historical
 manifest was verified byte-for-byte against the original, and `git diff --check` passed.
 
 This review uses source inspection and Foundry tests/fuzzing; it does not claim Slither/Mythril,

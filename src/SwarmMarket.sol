@@ -7,11 +7,11 @@ import {IAskSwarmRegistry} from "./SwarmWager.sol";
 /// @notice Anyone opens a market on a yes/no oracle question (the JSON body AskSwarmRegistry takes),
 /// escrowing the swarm's fee. Anyone stakes IMD on Yes or No until `closeAt`. After `resolveAfter`
 /// anyone calls `resolve` within RESOLVE_WINDOW, which buys the question through AskSwarmRegistry,
-/// then `settle` within ANSWER_WINDOW, which reads the registry's record: a verified bool answer
-/// agreed by a strict majority of a panel of at least MIN_PANEL decides the
+/// then `settle`, which reads the registry's record: a verified bool answer issued within
+/// ANSWER_WINDOW and agreed by a strict majority of a panel of at least MIN_PANEL decides the
 /// market. Winners `claim` their stake plus a pro-rata share of the losing pool, less a 2% fee on the
 /// losing pool split between the market's creator and the protocol treasury. Any other outcome
-/// (refused, split panel, unverified, lost, wrong type, no settlement within ANSWER_WINDOW, or a side
+/// (refused, split panel, unverified, lost, wrong type, no answer within ANSWER_WINDOW, or a side
 /// nobody took) makes the market void: everyone claims their full stake back and no fee is taken.
 ///
 /// Revenue: the fee is only taken from losers' stakes and only when the swarm settles the market.
@@ -49,12 +49,15 @@ contract SwarmMarket {
 
     /// @notice Time allowed to buy the question after resolveAfter. The last second is inclusive.
     uint64 public constant RESOLVE_WINDOW = 1 hours;
-    /// @notice Time allowed to settle after asking, inclusive. Unsettled markets then void.
+    /// @notice Time allowed for the swarm's answer after asking, inclusive. A market still pending
+    /// after it, or answered with a later issuedAt, voids.
     uint64 public constant ANSWER_WINDOW = 3 days;
     /// @notice Smallest panel allowed to decide a market; strict majority is also required.
     uint16 public constant MIN_PANEL = 7;
     /// @notice Fee on the losing pool, in basis points, taken only when the swarm settles the market.
     uint256 public constant FEE_BPS = 200;
+    /// @notice Largest body Intake accepts; a longer one could never be asked.
+    uint256 public constant MAX_BODY_BYTES = 16_384;
     uint8 internal constant BOOL = 0;
 
     IAskSwarmRegistry public immutable REGISTRY;
@@ -96,7 +99,9 @@ contract SwarmMarket {
 
     /// @notice Open a market. Pulls the registry's current price from the caller as the fee escrow.
     function open(bytes calldata body, uint64 closeAt, uint64 resolveAfter) external returns (uint256 id) {
-        if (body.length == 0 || closeAt <= block.timestamp || resolveAfter < closeAt) revert BadTerms();
+        if (body.length == 0 || body.length > MAX_BODY_BYTES || closeAt <= block.timestamp || resolveAfter < closeAt) {
+            revert BadTerms();
+        }
         uint256 p = REGISTRY.price();
         if (p == 0 || p > type(uint96).max) revert BadTerms();
         id = ++count;
@@ -171,21 +176,23 @@ contract SwarmMarket {
         _void(m, id, 2);
     }
 
-    /// @notice Decide from the registry within ANSWER_WINDOW. Anyone may call. After the deadline,
-    /// an unsettled market always voids, whether or not a late answer has reached the registry.
-    /// The live registry has no delivery timestamp, so a delivery-only deadline cannot be enforced.
+    /// @notice Decide from the registry's record. Anyone may call, at any time after the ask.
+    /// Still pending after ANSWER_WINDOW voids (reason 3). An answer whose signed issuedAt is after
+    /// the window voids (reason 22) whether it reached the registry before or after this call.
     function settle(uint256 id) external {
         Market storage m = markets[id];
         if (m.phase != Phase.Asked) revert WrongPhase(m.phase);
-        if (block.timestamp > uint256(m.askedAt) + ANSWER_WINDOW) return _void(m, id, 3);
+        uint256 deadline = uint256(m.askedAt) + ANSWER_WINDOW;
         (IAskSwarmRegistry.Ask memory k, IAskSwarmRegistry.Answer memory a) = REGISTRY.get(m.requestId);
         if (k.status == IAskSwarmRegistry.Status.Pending || k.status == IAskSwarmRegistry.Status.None) {
-            revert StillPending();
+            if (block.timestamp <= deadline) revert StillPending();
+            return _void(m, id, 3);
         }
         bool usable = k.status == IAskSwarmRegistry.Status.Answered && a.verified && a.answerType == BOOL
             && a.answer.length == 32 && uint256(a.agreed) * 2 > a.panelSize;
         if (!usable) return _void(m, id, uint8(k.status) + 10);
         if (a.panelSize < MIN_PANEL) return _void(m, id, 21);
+        if (a.issuedAt > deadline) return _void(m, id, 22);
         uint256 word = uint256(bytes32(a.answer));
         if (word > 1) return _void(m, id, 20);
 
