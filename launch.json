@@ -1,0 +1,14 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "SwarmMarket",
+      "constructorArgs": [
+        "0x53e1e2f33f05086086adf618ca92c3cb0ab111cd",
+        "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+        "0x571e17b13d8f6492bbc372a160520b20bfda320c"
+      ]
+    }
+  ],
+  "notes": "Deploy only the accepted SwarmMarket from src/SwarmMarket.sol on Ethereum mainnet. Constructor arguments are the existing AskSwarmRegistry (IMD launch #2099), IMD token, and AskSwarm operating treasury, in that order. The registry is already deployed. SwarmMarket has immutable dependencies, no owner, admin or upgrade path, and a nonpayable constructor with no external calls. Markets escrow the oracle fee and accept repeated IMD stakes on either side until closeAt. Resolution is allowed from resolveAfter through resolveAfter + 1 hour, inclusive; an unresolved open market can then be abandoned. Anyone may donate fee top-ups; all unspent escrow returns to the creator. Settlement must occur within 3 days of asking, inclusive, and requires a verified 32-byte bool word of 0 or 1 with a strict majority of a panel of at least 7. Other terminal outcomes or settlement after the deadline void the market. One-sided markets void without buying an answer. Successful settlement charges 2% of the losing pool, split between creator and treasury, with any odd fee unit going to treasury. Winners pull pro-rata payouts once per address; void markets refund stakes. Division dust remains in the contract. Oracle interpretation and answer binding rely on the existing registry and its trusted oracle operators. Question bodies are opaque; moving facts need absolute evidence windows. The 3-day limit is a settlement deadline because the registry exposes no delivery timestamp."
+}
