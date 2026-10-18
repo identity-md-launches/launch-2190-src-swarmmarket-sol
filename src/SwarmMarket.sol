@@ -6,11 +6,12 @@ import {IAskSwarmRegistry} from "./SwarmWager.sol";
 /// @title SwarmMarket: yes/no prediction markets settled by the IMD swarm
 /// @notice Anyone opens a market on a yes/no oracle question (the JSON body AskSwarmRegistry takes),
 /// escrowing the swarm's fee. Anyone stakes IMD on Yes or No until `closeAt`. After `resolveAfter`
-/// anyone calls `resolve`, which buys the question through AskSwarmRegistry, then `settle`, which reads
-/// the registry's record: a verified bool answer agreed by a strict majority of its panel decides the
+/// anyone calls `resolve` within RESOLVE_WINDOW, which buys the question through AskSwarmRegistry,
+/// then `settle` within ANSWER_WINDOW, which reads the registry's record: a verified bool answer
+/// agreed by a strict majority of a panel of at least MIN_PANEL decides the
 /// market. Winners `claim` their stake plus a pro-rata share of the losing pool, less a 2% fee on the
 /// losing pool split between the market's creator and the protocol treasury. Any other outcome
-/// (refused, split panel, unverified, lost, wrong type, no answer within ANSWER_WINDOW, or a side
+/// (refused, split panel, unverified, lost, wrong type, no settlement within ANSWER_WINDOW, or a side
 /// nobody took) makes the market void: everyone claims their full stake back and no fee is taken.
 ///
 /// Revenue: the fee is only taken from losers' stakes and only when the swarm settles the market.
@@ -46,7 +47,12 @@ contract SwarmMarket {
         bytes32 requestId;
     }
 
+    /// @notice Time allowed to buy the question after resolveAfter. The last second is inclusive.
+    uint64 public constant RESOLVE_WINDOW = 1 hours;
+    /// @notice Time allowed to settle after asking, inclusive. Unsettled markets then void.
     uint64 public constant ANSWER_WINDOW = 3 days;
+    /// @notice Smallest panel allowed to decide a market; strict majority is also required.
+    uint16 public constant MIN_PANEL = 7;
     /// @notice Fee on the losing pool, in basis points, taken only when the swarm settles the market.
     uint256 public constant FEE_BPS = 200;
     uint8 internal constant BOOL = 0;
@@ -64,6 +70,7 @@ contract SwarmMarket {
 
     event Opened(uint256 indexed id, address indexed creator, uint64 closeAt, uint64 resolveAfter, bytes body);
     event Staked(uint256 indexed id, address indexed user, bool yes, uint256 amount);
+    event FeeToppedUp(uint256 indexed id, address indexed funder, uint256 amount);
     event Resolving(uint256 indexed id, bytes32 indexed requestId);
     event Settled(uint256 indexed id, Phase phase, uint256 yesPool, uint256 noPool, uint256 fee, uint8 reason);
     event Claimed(uint256 indexed id, address indexed user, uint256 amount);
@@ -73,6 +80,7 @@ contract SwarmMarket {
     error WrongPhase(Phase have);
     error Closed();
     error TooEarly();
+    error TooLate();
     error StillPending();
     error NothingToClaim();
     error TransferFailed();
@@ -120,15 +128,30 @@ contract SwarmMarket {
         emit Staked(id, msg.sender, yes, amount);
     }
 
-    /// @notice After `resolveAfter`, buy the question from the swarm. If a side is empty there is
-    /// nothing to decide: the market goes void without spending the fee.
+    /// @notice Donate to an open market's oracle escrow if the price rises. Unspent contributions,
+    /// like the original escrow, return to the creator, not the donor. No stake or payout is added.
+    function topUpFee(uint256 id, uint96 amount) external {
+        Market storage m = markets[id];
+        if (m.phase != Phase.Open) revert WrongPhase(m.phase);
+        if (block.timestamp > uint256(m.resolveAfter) + RESOLVE_WINDOW) revert TooLate();
+        if (amount == 0) revert BadTerms();
+        m.feeEscrow += amount;
+        _pull(msg.sender, amount);
+        emit FeeToppedUp(id, msg.sender, amount);
+    }
+
+    /// @notice From `resolveAfter` through `resolveAfter + RESOLVE_WINDOW`, buy the question.
+    /// If a side is empty there is nothing to decide: void without spending the fee. For moving
+    /// facts, creators must use absolute evidence windows ending before resolveAfter: the caller
+    /// still chooses the ask time within this window, and the oracle processes it asynchronously.
     function resolve(uint256 id) external {
         Market storage m = markets[id];
         if (m.phase != Phase.Open) revert WrongPhase(m.phase);
         if (block.timestamp < m.resolveAfter) revert TooEarly();
+        if (block.timestamp > uint256(m.resolveAfter) + RESOLVE_WINDOW) revert TooLate();
         if (m.yesPool == 0 || m.noPool == 0) return _void(m, id, 1);
         uint256 p = REGISTRY.price();
-        if (p > m.feeEscrow) revert BadTerms(); // price rose above the escrow: `abandon` later
+        if (p == 0 || p > m.feeEscrow) revert BadTerms(); // top up a shortfall, or abandon after the window
         uint256 remainder = m.feeEscrow - p;
         m.phase = Phase.Asked;
         m.askedAt = uint64(block.timestamp);
@@ -139,26 +162,30 @@ contract SwarmMarket {
         emit Resolving(id, m.requestId);
     }
 
-    /// @notice An open market that could never be resolved: void it `ANSWER_WINDOW` after `resolveAfter`.
+    /// @notice Void an open market once its resolution window has expired. At that point resolve
+    /// is always forbidden, so a caller cannot race an otherwise valid resolve with abandonment.
     function abandon(uint256 id) external {
         Market storage m = markets[id];
         if (m.phase != Phase.Open) revert WrongPhase(m.phase);
-        if (block.timestamp <= uint256(m.resolveAfter) + ANSWER_WINDOW) revert TooEarly();
+        if (block.timestamp <= uint256(m.resolveAfter) + RESOLVE_WINDOW) revert TooEarly();
         _void(m, id, 2);
     }
 
-    /// @notice Decide the market from the registry's record. Anyone may call.
+    /// @notice Decide from the registry within ANSWER_WINDOW. Anyone may call. After the deadline,
+    /// an unsettled market always voids, whether or not a late answer has reached the registry.
+    /// The live registry has no delivery timestamp, so a delivery-only deadline cannot be enforced.
     function settle(uint256 id) external {
         Market storage m = markets[id];
         if (m.phase != Phase.Asked) revert WrongPhase(m.phase);
+        if (block.timestamp > uint256(m.askedAt) + ANSWER_WINDOW) return _void(m, id, 3);
         (IAskSwarmRegistry.Ask memory k, IAskSwarmRegistry.Answer memory a) = REGISTRY.get(m.requestId);
         if (k.status == IAskSwarmRegistry.Status.Pending || k.status == IAskSwarmRegistry.Status.None) {
-            if (block.timestamp <= uint256(m.askedAt) + ANSWER_WINDOW) revert StillPending();
-            return _void(m, id, 3);
+            revert StillPending();
         }
         bool usable = k.status == IAskSwarmRegistry.Status.Answered && a.verified && a.answerType == BOOL
             && a.answer.length == 32 && uint256(a.agreed) * 2 > a.panelSize;
         if (!usable) return _void(m, id, uint8(k.status) + 10);
+        if (a.panelSize < MIN_PANEL) return _void(m, id, 21);
         uint256 word = uint256(bytes32(a.answer));
         if (word > 1) return _void(m, id, 20);
 

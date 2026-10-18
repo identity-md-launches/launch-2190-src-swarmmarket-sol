@@ -246,6 +246,60 @@ Use it from Telegram with `/bet <question>`, or at [/wager](https://askswarm-nin
 15 fork tests in `test/SwarmWager.t.sol`. Launched through IMD like the registry; brief in
 `contracts/LAUNCH-WAGER.md`.
 
+### SwarmMarket launch
+
+[SwarmMarket](src/SwarmMarket.sol) pools IMD stakes on either side of a yes/no question.
+This contracts-only launch deploys **SwarmMarket alone** on Ethereum (chain id 1), with these
+three constructor arguments, in order:
+
+| Argument | Address |
+|---|---|
+| registry | `0x53e1e2f33f05086086adf618ca92c3cb0ab111cd` (existing launch #2099) |
+| imd | `0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7` |
+| treasury | `0x571e17b13d8f6492bbc372a160520b20bfda320c` |
+
+There is no owner, initializer, launch token or new registry. The constructor makes no external
+calls. IMD's launch pipeline supplies the new manifest and performs deployment; no market address
+is published here before that deployment. `contracts/launch-2099.json` is the archived registry
+manifest. `script/Deploy.s.sol` is also for that earlier registry, not for this launch.
+
+Market terms after the launch review:
+
+- `open(body, closeAt, resolveAfter)` escrows the current registry price. Stake repeatedly on either
+  side until strictly before `closeAt`. Read the complete immutable `bodyOf(id)` before staking.
+- `RESOLVE_WINDOW = 1 hours`: anyone can call `resolve(id)` from `resolveAfter` through
+  `resolveAfter + RESOLVE_WINDOW`, inclusive. After that, anyone can `abandon(id)` for refunds.
+  The two operations never overlap. The one-hour window limits a resolver's discretion while
+  allowing multiple Ethereum blocks for inclusion; it does not fix a relative evidence window.
+  For facts that can change, use an absolute `fromBlock`/`toBlock` window ending before
+  `resolveAfter`, with the closing block at least five deep when processed, and fixed dates in
+  offchain questions. Avoid “now,” “last day,” and other moving terms. The contract does not parse
+  JSON, police wording or guarantee processing time; users must evaluate these terms themselves.
+- `topUpFee(id, amount)` lets anyone donate IMD to an open market's escrow before its resolution
+  window expires. Approve SwarmMarket first. This can cover a price increase without using stakes.
+  **Unspent top-ups return to the creator**, just like the original escrow; they give the donor
+  no stake, refund entitlement or authority. A zero registry price means the action is unavailable.
+- `MIN_PANEL = 7`: a verified bool answer needs at least seven panel seats and a strict majority,
+  in addition to the quorum verification already performed by the registry. Smaller panels void
+  with settlement reason 21. Seven is a minimum against two-seat decisions, not an assurance
+  that any market size is safe. Creators can request larger panels; participants assess that risk.
+- `ANSWER_WINDOW = 3 days` is a **settlement deadline**: anyone must call `settle(id)` by
+  `askedAt + ANSWER_WINDOW`, inclusive. After it, any still-Asked market voids, even if an answer
+  is already in the registry. The live registry has no delivery timestamp, so a strict delivery
+  deadline cannot be distinguished from a late completion. This rule makes late-completion
+  transaction order irrelevant. Participants should monitor delivery and settle promptly.
+- `FEE_BPS = 200` remains 2% of the losing pool, split equally between creator and treasury
+  (an odd wei goes to treasury). Winners pull their stake plus their proportional share of the
+  remaining losing pool. Void markets refund stakes with no market fee; an oracle fee already
+  spent is not refunded. Claims have no deadline; division can leave unrecoverable rounding dust.
+
+The registry, Intake writer, oracle signer and panel remain trusted for answer correctness and
+question/request pairing. The market does not authenticate the JSON against `questionHash`.
+Its token accounting assumes the named IMD's ordinary ERC-20 transfers, without fees or rebasing.
+There is no admin recovery or dependency rotation. See [ADAPTATION.md](ADAPTATION.md) for the
+reproductions, tradeoffs and test coverage. Tests run offline with `forge build` and `forge test`;
+no new dependency or configuration is required.
+
 ### The flywheel back to the dataset
 
 The split-risk model reads `evalengine/imd-oracle-outcomes`; the registry writes back to it. A daily
