@@ -19,6 +19,14 @@ key and delivered with Intake's 200,000-gas allowance. Results include both vali
 booleans, refusal, split, lost callbacks, a wrong signer, a tied panel, a wrong type,
 a noncanonical boolean word, a short answer, and a panel below the minimum.
 
+The answer window follows the signed `issuedAt`, not the settle time. A delivered answer's
+`issuedAt` is the delivery time, the deadline (for a late delivery), or the second after the
+deadline (allowed by the registry's five-minute tolerance). The model expects a decisive
+answer issued within `ANSWER_WINDOW` to decide the market whenever settle runs. It expects
+an answer issued later, or a request still pending after the window, to void. The
+deterministic test pins both: a Yes signed one second late voids, and a Yes settled ten
+days after the window still pays Yes.
+
 Checks after every call cover:
 
 - The contract balance equals outstanding liabilities, rounding dust, and direct
@@ -74,7 +82,7 @@ by this test assignment.
 
 ## Local verification
 
-`forge build` passed. `forge test --summary` passed with 160 tests successful,
+`forge build` passed. `forge test` passed with 162 tests successful,
 zero failures, and one skipped live-suite setup (its three integration tests require
 an active mainnet fork). The new invariant campaign completed 256 runs and 24,576
 calls with zero unexpected handler reverts. Both payment fuzz tests completed

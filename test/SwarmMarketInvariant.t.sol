@@ -29,6 +29,7 @@ contract SwarmMarketHandler is Test {
         uint64 closeAt;
         uint64 resolveAfter;
         uint64 askedAt;
+        uint64 issuedAt;
         SwarmMarket.Phase phase;
         SwarmMarket.Phase answer;
         uint256 escrow;
@@ -58,6 +59,8 @@ contract SwarmMarketHandler is Test {
     uint256 public asks;
     uint256 public successfulClaims;
     uint256 public rejectedCalls;
+    uint256 public lateSettles;
+    uint256 public lateIssued;
     uint256[6] public transitions;
 
     constructor() {
@@ -197,6 +200,8 @@ contract SwarmMarketHandler is Test {
     }
 
     /// Callback results go through the actual registry's signature verification and 200k stipend.
+    /// The signed issuedAt is the delivery time, backdated to no later than the answer deadline,
+    /// or the second after the deadline when the registry's issuedAt tolerance allows it.
     function deliver(uint256 idSeed, uint8 kindSeed) public {
         uint256 id = _id(idSeed);
         Ledger storage g = ledger[id];
@@ -225,8 +230,16 @@ contract SwarmMarketHandler is Test {
             a.panelSize = 7;
             a.quorum = 4;
             a.agreed = 4;
-            a.issuedAt = uint64(vm.getBlockTimestamp());
-            a.expiresAt = a.issuedAt + 1 days;
+            uint256 now_ = vm.getBlockTimestamp();
+            uint256 deadline = uint256(g.askedAt) + 3 days;
+            uint256 variant = (kindSeed / 11) % 3;
+            uint256 issued = now_;
+            if (variant == 1 && deadline < now_) issued = deadline;
+            if (variant == 2 && deadline + 1 <= now_ + 5 minutes && deadline + 1 > now_) issued = deadline + 1;
+            a.issuedAt = uint64(issued);
+            a.expiresAt = uint64((issued > now_ ? issued : now_) + 1 days);
+            g.issuedAt = a.issuedAt;
+            if (issued > deadline) lateIssued++;
             if (kind == 6) a.panelSize = 8; // exactly half the panel
             if (kind == 7) a.answerType = 3;
             if (kind == 8) a.answer = abi.encode(uint256(2));
@@ -254,7 +267,15 @@ contract SwarmMarketHandler is Test {
         }
         vm.prank(actors[actorSeed % 4]);
         market.settle(id);
-        _finish(id, expired ? SwarmMarket.Phase.Void : g.answer);
+        // Pending past the window voids; a decisive answer decides however late settle is called,
+        // unless its signed issuedAt is after the window.
+        SwarmMarket.Phase outcome = g.answer;
+        if (outcome == SwarmMarket.Phase.None) outcome = SwarmMarket.Phase.Void;
+        if (outcome != SwarmMarket.Phase.Void && g.issuedAt > uint256(g.askedAt) + 3 days) {
+            outcome = SwarmMarket.Phase.Void;
+        }
+        if (expired && outcome != SwarmMarket.Phase.Void) lateSettles++;
+        _finish(id, outcome);
     }
 
     function abandon(uint256 idSeed, uint256 actorSeed) public {
@@ -528,6 +549,17 @@ contract SwarmMarketInvariantTest is Test {
         handler.stake(2, 0, true, 1); // closed terminal market
         handler.settle(5, 0); // pending registry result
         assertGe(handler.rejectedCalls(), 3);
+        // A Yes delivered at the deadline but signed for the second after it voids, not Yes.
+        handler.advance(5, 5, 0);
+        handler.deliver(5, 22);
+        assertEq(handler.lateIssued(), 1);
+        handler.settle(5, 1);
+        (SwarmMarket.Market memory m,) = handler.market().get(5);
+        assertEq(uint8(m.phase), uint8(SwarmMarket.Phase.Void));
+        // Market 4's Yes was issued in the window; settling 10 days later still decides it.
         handler.unwind();
+        assertEq(handler.lateSettles(), 1);
+        (m,) = handler.market().get(4);
+        assertEq(uint8(m.phase), uint8(SwarmMarket.Phase.Yes));
     }
 }
